@@ -1,3 +1,5 @@
+# generation.py
+
 import networkx as nx
 import time
 import os
@@ -34,16 +36,28 @@ class CodeGenerator:
                 logging.error(f"Generate Error: {e}")
             return ""
 
-    def _create_file(self, filepath, content=""):
-        try:
-            Path(filepath).parent.mkdir(parents=True, exist_ok=True)
-            with open(filepath, "w", encoding="utf-8") as f:
-                f.write(content)
-        except Exception as e:
-            if "maximum context length" in str(e):
-                logging.error(f"OpenAI API context length exceeded: {e}")
-            else:
-                logging.error(f"Error while creating file '{filepath}': {e}")
+    def _create_file(self, filepath, content="", max_retries=3, retry_delay=1):
+        directory = os.path.dirname(filepath)
+        if not os.path.exists(directory):
+            os.makedirs(directory, exist_ok=True)
+
+        for attempt in range(max_retries):
+            try:
+                with open(filepath, "w", encoding="utf-8") as f:
+                    f.write(content)
+            
+                if os.path.exists(filepath):
+                    return True
+                else:
+                    logging.warning(f"File '{filepath}' not found after creation. Retrying...")
+            except Exception as e:
+                logging.error(f"Error while creating file '{filepath}': {str(e)}. Retrying...")
+        
+            time.sleep(retry_delay)
+    
+        logging.error(f"Failed to create file '{filepath}' after {max_retries} attempts.")
+        return False
+
 
     def _analyze_code(self, code):
         try:
@@ -95,40 +109,50 @@ class CodeGenerator:
     def _preprocess_code(self, code):
         return re.sub(r'""".*?"""', '', code, flags=re.DOTALL)
 
-    def _find_similar_code(self, code_snippet, top_k=3):
+    def _find_similar_code(self, desc, top_k=3):
         try:
-            embedding = self.embedding_model.encode([code_snippet])
-            similarities = [(mod, cosine_similarity(embedding, emb.reshape(1, -1))[0][0]) for mod, emb in
-                            self.memory['modules'].items()]
+            embedding = self.embedding_model.encode([desc])
+            similarities = []
+            for mod in self.memory['modules']:
+                summary_similarity = cosine_similarity(embedding, self.memory['modules'][mod]['summary_embedding'].reshape(1, -1))[0][0]
+                dependency_similarity = self._calculate_dependency_similarity(mod)
+                combined_similarity = 0.7 * summary_similarity + 0.3 * dependency_similarity
+                similarities.append((mod, combined_similarity))
             return sorted(similarities, key=lambda x: x[1], reverse=True)[:top_k]
         except Exception as e:
             logging.error(f"SimilarityError: {e}")
             return []
+        
+    def _calculate_dependency_similarity(self, module_path):
+        module_dependencies = set(self.graph.predecessors(module_path))
+        return len(module_dependencies.intersection(self.memory['modules'].keys())) / len(module_dependencies)
 
     def _summarize_code(self, code):
         try:
             prompt = self.cfg['prompt_template']['summarize'].format(code=code)
-            return self._generate(prompt, "summarize")
+            summary = self._generate(prompt, "summarize")
+            summary_embedding = self.embedding_model.encode([summary])[0]
+            return summary, summary_embedding
         except Exception as e:
             logging.error(f"SummarizationError: {e}")
-            return "Error summarizing code"
+            return "Error summarizing code", None
 
     def _get_module_context(self, module_path):
         related_modules = self.graph.neighbors(module_path)
         related_summaries = [self.memory['modules'][mod]['summary'] for mod in related_modules]
         return f"Related module summaries:\n" + "\n".join(related_summaries)
 
-    def _refine_code(self, code, summary, analysis, context, iterations=3):
+    def _refine_code(self, code, summary, analysis, context, similar_context, iterations=3):
         for i in range(iterations):
             prompt = self.cfg['prompt_template']['refine'].format(
-                code=code, summary=summary, analysis=analysis, context=self.project_context
+                code=code, summary=summary, analysis=analysis, context=self.project_context, similar_context=similar_context
             )
             try:
                 code = self._generate(prompt, "refine")
                 if not code:
                     break
                 analysis = self._analyze_code(code)
-                summary = self._summarize_code(code)
+                summary, _ = self._summarize_code(code)
             except Exception as e:
                 logging.error(f"RefinementError: {e}")
                 break
@@ -149,7 +173,6 @@ class CodeGenerator:
         return "\n\n".join([f"{path}:\n{self.memory['modules'][path]['summary']}" for path in module_paths])
 
     def _generate_module(self, name, desc, project_context, max_retries=3):
-        """Generate a module with the given name, description, and project context."""
         for attempt in range(max_retries):
             prompt = self.cfg['prompt_template']['code'].format(
                 name=name, desc=desc, project_context=project_context
@@ -160,8 +183,17 @@ class CodeGenerator:
                 continue
             if self._is_valid_code(code):
                 analysis = self._analyze_code(code)
-                summary = self._summarize_code(code)
-                return code, summary, analysis
+                summary, summary_embedding = self._summarize_code(code)
+                module_path = os.path.join(os.getcwd(), name + ".py")
+                self.memory['modules'][module_path] = {'code': code, 'summary': summary, 'analysis': analysis, 'summary_embedding': summary_embedding}
+            
+                # Find similar modules and pass them as context for refinement
+                similar_modules = self._find_similar_code(desc)
+                similar_context = "\n".join([f"{mod}: {self.memory['modules'][mod]['summary']}" for mod, _ in similar_modules])
+                refined_code, refined_summary, refined_analysis = self._refine_code(code, summary, analysis, project_context, similar_context)
+            
+                return refined_code, refined_summary, refined_analysis
+        
             logging.info(f"Retry generating {name} module (attempt {attempt + 1})")
         return "", "", {}
 
