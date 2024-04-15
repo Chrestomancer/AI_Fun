@@ -9,10 +9,22 @@ class AIServiceFactory:
 
     @staticmethod
     def set_ai_service(service):
+        """
+        Sets the AI service to the provided service.
+        Parameters:
+            service: The AI service to be set.
+        Returns:
+            None
+        """
         AIServiceFactory._service = service
 
     @staticmethod
     def get_ai_service() -> AIServiceInterface:
         if AIServiceFactory._service is None:
-            raise ValueError("AI service not set")
+            try:
+                config = ConfigEnvironmentModule()
+                AIServiceFactory._service = config.create_ai_service()
+            except ValueError as e:
+                print(f"Error getting AI service: {e}")
+                return None
         return AIServiceFactory._service

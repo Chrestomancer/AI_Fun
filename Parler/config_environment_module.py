@@ -63,13 +63,14 @@ class ConfigEnvironmentModule:
 
     def create_ai_service(self):
         service_name = self.ai_service
-        if service_name == "openai":
-            return OpenAIAdapter(self.api_key)
-        elif service_name == "gemini":
-            return GeminiAdapter(self.api_key)
-        elif service_name == "mistral":
-            return MistralAdapter(self.api_key)
+        api_key = self.load_api_key(service_name)
+        if service_name == "openai" and api_key:
+            return OpenAIAdapter(api_key)
+        elif service_name == "gemini" and api_key:
+            return GeminiAdapter(api_key)
+        elif service_name == "mistral" and api_key:
+            return MistralAdapter(api_key)
         elif service_name == "huggingface":
             return HuggingFaceAdapter()
         else:
-            raise ValueError(f"Unsupported AI service: {service_name}")
+            raise ValueError(f"Unsupported or unconfigured AI service: {service_name}")

@@ -61,7 +61,7 @@ def split_audio_by_silence(audio_data, sampling_rate, min_silence_len=2000):
     spectral_centroids = librosa.feature.spectral_centroid(y=audio_data, sr=sampling_rate)[0]
 
     # Adaptive thresholding and silence detection
-    frames = librosa.util.frame(audio_data, frame_length=1024, hop_length=256)
+    frames = librosa.util.frame(audio_data, frame_length=2048, hop_length=512)
     frames_energy = np.sum(frames**2, axis=0)
     silence_threshold = np.mean(frames_energy) / 4  # Adjust factor as needed
     is_silence = frames_energy < silence_threshold
@@ -116,20 +116,20 @@ def split_conversation(full_conversation):
     return alice_text, bob_text
 
 
-def interleave_audio_segments(alice_segments, bob_segments, sampling_rate, pause_duration=0.5):
-    silence = np.zeros((int(sampling_rate * pause_duration),), dtype=np.float32)
-    combined_audio = []
-
-    max_segments = max(len(alice_segments), len(bob_segments))
-    for i in range(max_segments):
+def interleave_audio_segments(alice_segments, bob_segments, sampling_rate):
+    silence = np.zeros((int(sampling_rate * 0.5),), dtype=np.float32)
+    all_audio_data = []
+    for i in range(max(len(alice_segments), len(bob_segments))):
         if i < len(alice_segments):
-            combined_audio.append(alice_segments[i])
-            combined_audio.append(silence)
+            all_audio_data.append(alice_segments[i])
         if i < len(bob_segments):
-            combined_audio.append(bob_segments[i])
-            combined_audio.append(silence)
+            all_audio_data.append(silence)
+            all_audio_data.append(bob_segments[i])
+        if i < len(alice_segments) or i < len(bob_segments):
+            all_audio_data.append(silence)
+    combined_audio = np.concatenate(all_audio_data, axis=0)
+    return combined_audio
 
-    return np.concatenate(combined_audio, axis=0)
 
 def play_audio(audio_data, sampling_rate):
     audio_data = (audio_data * 32767).astype(np.int16)
