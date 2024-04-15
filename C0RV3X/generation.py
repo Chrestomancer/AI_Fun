@@ -1,67 +1,64 @@
 # generation.py
 
-import networkx as nx
-import time
 import os
 import openai
-from pathlib import Path
 import logging
 import ast
 import re
-from sklearn.metrics.pairwise import cosine_similarity
 from radon.metrics import mi_visit
+from transformers import GPT2TokenizerFast
+import torch
+from torch.nn import functional as F
+from tqdm import tqdm
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
+from nltk.translate.bleu_score import sentence_bleu
+from nltk.translate.meteor_score import meteor_score
+from rouge import Rouge
+from sumy.parsers.plaintext import PlaintextParser
+from sumy.nlp.tokenizers import Tokenizer
+from sumy.summarizers.lsa import LsaSummarizer
 
-class CodeGenerator:
+class InnovativeCodeGenerator:
     def __init__(self, api_key, cfg, embedding_model):
-        self.graph = nx.DiGraph()
         self.memory = {}
         self.client = openai.OpenAI(api_key=api_key)
         self.cfg = cfg
         self.embedding_model = embedding_model
-        self.models = cfg.get("models", {"default": ("gpt-4-turbo-preview", 0.7, 0.95)})
-        self.project_context = ""
+        self.tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+        self.rouge = Rouge()
+        self.summarizer = LsaSummarizer()
 
-    def _generate(self, prompt, task):
+    def _generate(self, prompt, task, n=1, stop=None, temperature=0.7, top_p=0.9, top_k=40, repetition_penalty=1.2):
         logging.debug(f"Generating code for task: {task}")
         try:
-            model, temp, top_p = self.models.get(task, self.models["default"])
             response = self.client.chat.completions.create(
-                model=model, messages=[{"role": "system", "content": self.cfg['roles'][task]}, {"role": "user", "content": prompt}],
-                temperature=temp, top_p=top_p, max_tokens=self.cfg['max_tokens'], stream=False
+                model=self.cfg["models"][task],
+                messages=[{"role": "system", "content": self.cfg['roles'][task]}, {"role": "user", "content": prompt}],
+                n=n,
+                stop=stop,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                repetition_penalty=repetition_penalty
             )
-            logging.debug(f"Generated code for task {task}: {response.choices[0].message.content.strip()}")
-            return response.choices[0].message.content.strip()
+            generated_codes = [choice.message.content.strip() for choice in response.choices]
+            logging.debug(f"Generated code for task {task}: {generated_codes}")
+            return generated_codes
         except Exception as e:
-            if "maximum context length" in str(e):
-                logging.error(f"OpenAI API context length exceeded: {e}")
-            else:
-                logging.error(f"Generate Error: {e}")
-            return ""
+            logging.error(f"Generate Error: {e}")
+            return []
 
-    def _create_file(self, filepath, content="", max_retries=3, retry_delay=1):
+    def _create_file(self, filepath, content=""):
         logging.debug(f"Creating file: {filepath}")
         directory = os.path.dirname(filepath)
         if not os.path.exists(directory):
             os.makedirs(directory, exist_ok=True)
 
-        for attempt in range(max_retries):
-            try:
-                with open(filepath, "w", encoding="utf-8") as f:
-                    logging.debug(f"Writing content to file: {filepath}")
-                    f.write(content)
-            
-                if os.path.exists(filepath):
-                    return True
-                else:
-                    logging.warning(f"File '{filepath}' not found after creation. Retrying...")
-            except Exception as e:
-                logging.error(f"Error while creating file '{filepath}': {str(e)}. Retrying...")
-        
-            time.sleep(retry_delay)
-    
-        logging.error(f"Failed to create file '{filepath}' after {max_retries} attempts.")
-        return False
-
+        with open(filepath, "w", encoding="utf-8") as f:
+            logging.debug(f"Writing content to file: {filepath}")
+            f.write(content)
 
     def _analyze_code(self, code):
         logging.debug("Analyzing code")
@@ -75,147 +72,154 @@ class CodeGenerator:
             logging.debug(f"Code analysis: {analysis}")
             return analysis
         except SyntaxError as e:
-            if "EOL while scanning string literal" in str(e):
-                return self._analyze_code(code.replace("'", "\\'").replace('"', '\\"'))
             logging.error(f"SyntaxError: {e}")
             return {'imports': [], 'functions': [], 'classes': [], 'complexity': 0, 'maintainability_index': 0}
-
-    def _update_graph(self, module_path, code):
-        logging.debug(f"Updating graph for module: {module_path}")
-        try:
-            tree = ast.parse(code)
-            imports = [node.names[0].name for node in ast.walk(tree) if isinstance(node, ast.Import)]
-            from_imports = [f"{node.module}.{node.names[0].name}" for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)]
-        except SyntaxError:
-            logging.warning(f"Failed to parse code for module: {module_path}")
-            return
-
-        self.graph.add_node(module_path)
-
-        for imported_module in imports + from_imports:
-            imported_module_path = os.path.join(os.path.dirname(module_path), f"{imported_module}.py")
-            if imported_module_path in self.memory:
-                self.graph.add_edge(module_path, imported_module_path)
-
-        try:
-            tree = ast.parse(code)
-            analyzer = FunctionCallAnalyzer()
-            analyzer.visit(tree)
-            for called_func, called_from in analyzer.function_calls:
-                logging.debug(f"Function call: {called_func} called from {called_from}")
-                if called_from == module_path:
-                    caller_module = module_path
-                else:
-                    caller_module = os.path.join(os.path.dirname(module_path), f"{called_from}.py")
-
-                if called_func in self.memory:
-                    called_module = os.path.join(os.path.dirname(module_path), f"{called_func}.py")
-                    self.graph.add_edge(caller_module, called_module)
-        except SyntaxError:
-            logging.warning(f"Failed to analyze function calls for module: {module_path}")
 
     def _preprocess_code(self, code):
         logging.debug("Preprocessing code")
         return re.sub(r'""".*?"""', '', code, flags=re.DOTALL)
 
-    def _find_similar_code(self, desc, top_k=3):
-        logging.debug(f"Finding similar code for description: {desc}")
-        try:
-            embedding = self.embedding_model.encode([desc])
-            similarities = []
-            for mod in self.memory['modules']:
-                summary_similarity = cosine_similarity(embedding, self.memory['modules'][mod]['summary_embedding'].reshape(1, -1))[0][0]
-                dependency_similarity = self._calculate_dependency_similarity(mod)
-                combined_similarity = 0.7 * summary_similarity + 0.3 * dependency_similarity
-                similarities.append((mod, combined_similarity))
-            logging.debug(f"Similar modules: {similarities}")
-            return sorted(similarities, key=lambda x: x[1], reverse=True)[:top_k]
-        except Exception as e:
-            logging.error(f"SimilarityError: {e}")
-            return []
-        
-    def _calculate_dependency_similarity(self, module_path):
-        module_dependencies = set(self.graph.predecessors(module_path))
-        return len(module_dependencies.intersection(self.memory['modules'].keys())) / len(module_dependencies)
-
     def _summarize_code(self, code):
         logging.debug("Summarizing code")
         try:
-            prompt = self.cfg['prompt_template']['summarize'].format(code=code)
-            summary = self._generate(prompt, "summarize")
+            parser = PlaintextParser.from_string(code, Tokenizer("english"))
+            summary = self.summarizer(parser.document, 3)
+            summary = " ".join([str(sentence) for sentence in summary])
             logging.debug(f"Code summary: {summary}")
-            summary_embedding = self.embedding_model.encode([summary])[0]
-            return summary, summary_embedding
+            return summary
         except Exception as e:
             logging.error(f"SummarizationError: {e}")
-            return "Error summarizing code", None
+            return "Error summarizing code"
 
-    def _get_module_context(self, module_path):
-        related_modules = self.graph.neighbors(module_path)
-        related_summaries = [self.memory['modules'][mod]['summary'] for mod in related_modules]
-        logging.debug(f"Related module summaries: {related_summaries}")
-        return f"Related module summaries:\n" + "\n".join(related_summaries)
-
-    def _refine_code(self, code, summary, analysis, context, similar_context, iterations=3):
+    def _refine_code(self, code, summary, analysis, context, iterations=3):
         for i in range(iterations):
             logging.debug(f"Refining code, iteration {i + 1}")
             prompt = self.cfg['prompt_template']['refine'].format(
-                code=code, summary=summary, analysis=analysis, context=self.project_context, similar_context=similar_context
+                code=code, summary=summary, analysis=analysis, context=context
             )
             try:
-                code = self._generate(prompt, "refine")
-                if not code:
+                refined_codes = self._generate(prompt, "refine", n=3, stop=["```"])
+                if not refined_codes:
                     break
+
+                # Select the best refined code based on BLEU score
+                bleu_scores = [sentence_bleu([code], refined_code) for refined_code in refined_codes]
+                best_idx = bleu_scores.index(max(bleu_scores))
+                code = refined_codes[best_idx]
+
                 analysis = self._analyze_code(code)
-                summary, _ = self._summarize_code(code)
+                summary = self._summarize_code(code)
             except Exception as e:
                 logging.error(f"RefinementError: {e}")
                 break
         return code, summary, analysis
 
-    def relate_modules(self, module_paths):
-        prompt = self.cfg['prompt_template']['relate_modules'].format(
-            summaries=self._get_module_summaries(module_paths)
+    def _generate_test_cases(self, code, summary, n=3):
+        logging.debug("Generating test cases")
+        prompt = self.cfg['prompt_template']['test_cases'].format(code=code, summary=summary)
+        test_cases = self._generate(prompt, "test_cases", n=n, stop=["```"])
+        return test_cases
+
+    def _evaluate_test_cases(self, code, test_cases):
+        logging.debug("Evaluating test cases")
+        prompt = self.cfg['prompt_template']['evaluate_tests'].format(code=code, test_cases="\n".join(test_cases))
+        evaluation = self._generate(prompt, "evaluate_tests", n=1)[0]
+        return evaluation
+
+    def _find_similar_code(self, code, top_k=3):
+        logging.debug(f"Finding similar code")
+        try:
+            code_embedding = self.embedding_model.encode([code])[0]
+            similarities = []
+            for code_id, code_data in self.memory.items():
+                code_embedding_mem = code_data['embedding']
+                similarity = cosine_similarity([code_embedding], [code_embedding_mem])[0][0]
+                similarities.append((code_id, similarity))
+            similarities = sorted(similarities, key=lambda x: x[1], reverse=True)
+            return [self.memory[code_id]['code'] for code_id, _ in similarities[:top_k]]
+        except Exception as e:
+            logging.error(f"SimilarityError: {e}")
+            return []
+
+    def _cluster_code(self, n_clusters=5):
+        logging.debug("Clustering code")
+        try:
+            code_embeddings = [code_data['embedding'] for code_data in self.memory.values()]
+            kmeans = KMeans(n_clusters=n_clusters, random_state=42).fit(code_embeddings)
+            labels = kmeans.labels_
+            for i, (code_id, code_data) in enumerate(self.memory.items()):
+                code_data['cluster'] = labels[i]
+        except Exception as e:
+            logging.error(f"ClusteringError: {e}")
+
+    def _visualize_code_space(self):
+        logging.debug("Visualizing code space")
+        try:
+            code_embeddings = [code_data['embedding'] for code_data in self.memory.values()]
+            pca = PCA(n_components=2, random_state=42).fit_transform(code_embeddings)
+            # Visualize the code space using a scatter plot
+            import matplotlib.pyplot as plt
+            plt.figure(figsize=(8, 6))
+            plt.scatter(pca[:, 0], pca[:, 1], c=[code_data['cluster'] for code_data in self.memory.values()])
+            plt.xlabel("PCA Component 1")
+            plt.ylabel("PCA Component 2")
+            plt.title("Code Space Visualization")
+            plt.colorbar(ticks=range(max([code_data['cluster'] for code_data in self.memory.values()]) + 1))
+            plt.show()
+        except Exception as e:
+            logging.error(f"VisualizationError: {e}")
+
+    def _store_generated_code(self, code):
+        logging.debug("Storing generated code")
+        try:
+            code_embedding = self.embedding_model.encode([code])[0]
+            code_id = len(self.memory)
+            self.memory[code_id] = {'code': code, 'embedding': code_embedding}
+        except Exception as e:
+            logging.error(f"CodeStorageError: {e}")
+
+    def generate_and_store_code(self, name, desc, context):
+        prompt = self.cfg['prompt_template']['code'].format(
+            name=name, desc=desc, context=context
         )
-        relation = self._generate(prompt, "relate_modules")
-        for path in module_paths:
-            self.memory['modules'][path]['relation'] = relation
+        generated_codes = self._generate(prompt, "code", n=3, stop=["```"])
+        if not generated_codes:
+            logging.error(f"Failed to generate code for {name} module")
+            return "", "", {}
 
-    def set_project_context(self, context):
-        logging.debug(f"Setting project context: {context}")
-        self.project_context = context
-
-    def _get_module_summaries(self, module_paths):
-        return "\n\n".join([f"{path}:\n{self.memory['modules'][path]['summary']}" for path in module_paths])
-        logging.debug(f"Module summaries: {summaries}")
-
-    def _generate_module(self, name, desc, project_context, max_retries=3):
-        for attempt in range(max_retries):
-            prompt = self.cfg['prompt_template']['code'].format(
-                name=name, desc=desc, project_context=project_context
-            )
-            code = self._generate(prompt, "code")
-            if not code:
-                logging.error(f"Failed to generate code for {name} module")
-                continue
+        # Select the best generated code based on code analysis metrics
+        analyzed_codes = []
+        for code in generated_codes:
             if self._is_valid_code(code):
                 analysis = self._analyze_code(code)
-                logging.debug(f"Code analysis for {name} module: {analysis}")
-                summary, summary_embedding = self._summarize_code(code)
-                module_path = os.path.join(os.getcwd(), name + ".py")
-                self.memory['modules'][module_path] = {'code': code, 'summary': summary, 'analysis': analysis, 'summary_embedding': summary_embedding}
-            
-                # Find similar modules and pass them as context for refinement
-                logging.debug(f"Finding similar modules for {name} module")
-                similar_modules = self._find_similar_code(desc)
-                similar_context = "\n".join([f"{mod}: {self.memory['modules'][mod]['summary']}" for mod, _ in similar_modules])
-                refined_code, refined_summary, refined_analysis = self._refine_code(code, summary, analysis, project_context, similar_context)
-            
-                return refined_code, refined_summary, refined_analysis
+                score = analysis['maintainability_index'] / (analysis['complexity'] + 1)
+                analyzed_codes.append((code, score))
+            else:
+                logging.warning(f"Invalid code generated for {name} module")
         
-            logging.info(f"Retry generating {name} module (attempt {attempt + 1})")
-        return "", "", {}
+        if not analyzed_codes:
+            logging.error(f"No valid code generated for {name} module")
+            return "", "", {}
 
+        best_code, _ = max(analyzed_codes, key=lambda x: x[1])
+        summary = self._summarize_code(best_code)
+        test_cases = self._generate_test_cases(best_code, summary)
+        evaluation = self._evaluate_test_cases(best_code, test_cases)
+        logging.info(f"Test case evaluation for {name} module: {evaluation}")
+
+        refined_code, refined_summary, refined_analysis = self._refine_code(best_code, summary, analysis, context)
+
+        similar_codes = self._find_similar_code(refined_code)
+        if similar_codes:
+            logging.info(f"Similar code found for {name} module:")
+            for code in similar_codes:
+                logging.info(code)
+
+        self._store_generated_code(refined_code)
+        self._cluster_code()
+        self._visualize_code_space()
+
+        return refined_code, refined_summary, refined_analysis
 
     def _is_valid_code(self, code):
         try:
@@ -224,19 +228,42 @@ class CodeGenerator:
         except SyntaxError:
             return False
 
-class FunctionCallAnalyzer(ast.NodeVisitor):
+class ASTAnalyzer(ast.NodeVisitor):
     def __init__(self):
-        self.function_calls = []
+        self.imports = []
+        self.functions = []
+        self.classes = []
+        self.complexity = 1
 
-    def visit_Call(self, node):
-        if isinstance(node.func, ast.Attribute):
-            called_func = node.func.attr
-            called_from = node.func.value.id
-        elif isinstance(node.func, ast.Name):
-            called_func = node.func.id
-            called_from = None
-        else:
-            return
+    def visit_Import(self, node):
+        for alias in node.names:
+            self.imports.append(alias.name)
+        self.complexity += 1
 
-        self.function_calls.append((called_func, called_from))
-        self.generic_visit(node)
+    def visit_ImportFrom(self, node):
+        self.imports.append(node.module)
+        self.complexity += 1
+
+    def visit_FunctionDef(self, node):
+        self.functions.append(node.name)
+        self.complexity += 1
+
+    def visit_ClassDef(self, node):
+        self.classes.append(node.name)
+        self.complexity += 1
+
+    def visit_If(self, node):
+        self.complexity += len(node.body) + 1
+
+    def visit_For(self, node):
+        self.complexity += len(node.body) + 1
+
+    def visit_While(self, node):
+        self.complexity += len(node.body) + 1
+
+    def visit_Try(self, node):
+        self.complexity += len(node.body) + len(node.handlers) + 1
+
+    def get_analysis(self):
+        return {'imports': self.imports, 'functions': self.functions, 'classes': self.classes,
+                'complexity': self.complexity}
